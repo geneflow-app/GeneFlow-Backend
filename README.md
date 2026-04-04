@@ -30,28 +30,53 @@
 GeneFlow Backend is the **core API** that produces **all** domain events to the Redis event bus. It handles authentication, study management, trace processing coordination, and subscription billing — acting as the primary command gateway for the entire GeneFlow platform.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         REDIS STREAMS (Event Bus)                        │
-│   geneflow:events:{users|studies|traces|alignments|subscriptions|...}   │
-└────────────┬──────────────────┬──────────────────┬──────────────────────┘
-             │                  │                  │
-        PUBLISH            PUBLISH            SUBSCRIBE
-             │                  │                  │
-             ▼                  ▼                  ▼
-┌────────────────┐    ┌────────────────┐    ┌────────────────┐
-│  GeneFlow API  │    │ GeneFlow Worker│    │GeneFlow Datalake│
-│    (.NET 8)    │    │   (Python)     │    │    (Python)     │
-│                │    │                │    │                 │
-│ Produce ALL    │    │ TraceProcessor │    │ SOURCE OF TRUTH │
-│ domain events  │    │ AlignmentProc. │    │ Persists TODO   │
-└───────┬────────┘    └────────────────┘    └────────┬────────┘
-        │                                            │
-        ▼                                            ▼
-┌────────────────┐                          ┌────────────────┐
-│  PostgreSQL    │◄─────── MOUNTER ─────────│   JSONL Files  │
-│  (Datamart)    │                          │ (Event Store)  │
-│  DISPOSABLE    │                          │   IMMUTABLE    │
-└────────────────┘                          └────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    EVENT BUS (Redis Streams)                             │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────┐│
+│  │                           geneflow:events:{category}                                ││
+│  │  users, studies, traces, alignments, subscriptions, plans, ai, blast, system       ││
+│  └─────────────────────────────────────────────────────────────────────────────────────┘│
+└───────────┬─────────────────────┬─────────────────────┬─────────────────────┬───────────┘
+            │                     │                     │                     │
+      send/subscribe        send/subscribe        send/subscribe         subscribe
+            │                     │                     │                     │
+            ▼                     ▼                     ▼                     ▼
+┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐
+│   GENEFLOW API    │  │  GENEFLOW WORKER  │  │   GENEFLOW AI     │  │ GENEFLOW DATALAKE │
+│   (.NET 8)        │  │  (Python)         │  │   (Python)        │  │   (Python)        │
+├───────────────────┤  ├───────────────────┤  ├───────────────────┤  ├───────────────────┤
+│                   │  │                   │  │                   │  │                   │
+│ Produce events    │  │ • TraceProcessor  │  │ • Embeddings      │  │ SOURCE OF TRUTH   │
+│ for ALL domain    │  │ • AlignmentProc.  │  │ • Vector Search   │  │                   │
+│ operations        │  │ • BlastProcessor  │  │ • Similarity      │  │ Persists ALL      │
+│                   │  │                   │  │ • Claude API      │  │ events (JSONL)    │
+│                   │  │                   │  │                   │  │                   │
+│                   │  │                   │  │                   │  │ Immutable         │
+│                   │  │                   │  │                   │  │ Append-only       │
+└───────────────────┘  └───────────────────┘  └───────────────────┘  └───────────────────┘
+                                                                              │
+                                                                              ▼
+       ┌──────────────────────────────────────────────────────────────────────────────────┐
+       │                                   MOUNTERS                                        │
+       │           Read events from Datalake → Transform → Materialize to targets         │
+       └──────────┬───────────────────────┬───────────────────────┬───────────────────────┘
+                  │                       │                       │
+                  ▼                       ▼                       ▼
+       ┌───────────────────┐   ┌───────────────────┐   ┌───────────────────┐
+       │    PostgreSQL     │   │      Qdrant       │   │   Storage/Files   │
+       │    (Datamart)     │   │  (Vector DB)      │   │    (Datamart)     │
+       ├───────────────────┤   ├───────────────────┤   ├───────────────────┤
+       │                   │   │                   │   │                   │
+       │ identity.users    │   │ geneflow_sequences│   │ traces/{id}/      │
+       │ studies.studies   │   │ geneflow_annotations│ │   ├─ original.ab1 │
+       │ studies.members   │   │ geneflow_traces   │   │   ├─ manifest.json│
+       │ traces.traces     │   │                   │   │   └─ chunks/      │
+       │ alignments.*      │   │ Semantic search   │   │                   │
+       │ billing.*         │   │ Similarity match  │   │ alignments/{id}/  │
+       │                   │   │                   │   │   └─ chunks/      │
+       │ DISPOSABLE        │   │ DISPOSABLE        │   │                   │
+       │ RECONSTRUCTIBLE   │   │ RECONSTRUCTIBLE   │   │ DISPOSABLE        │
+       └───────────────────┘   └───────────────────┘   └───────────────────┘
 ```
 
 ---
@@ -105,7 +130,7 @@ The API operates with **event-first** architecture and **CQRS** pattern.
 
 # Clone and restore
 git clone https://github.com/geneflow-app/geneflow-backend.git
-cd geneflow-backend/GeneFlow.APINET2
+cd geneflow-backend/GeneFlow.ApiNet2
 dotnet restore
 
 # Run the API
@@ -225,6 +250,8 @@ All domain events are published to Redis Streams with the prefix `geneflow:event
 | `alignments` | AlignmentCreated, AlignmentStarted, AlignmentCompleted, AlignmentFailed |
 | `subscriptions` | SubscriptionCreated, PlanChanged, SubscriptionCancelled, ... |
 | `plans` | PlanCreated |
+| `ai` | EmbeddingGenerated, SimilaritySearchCompleted, ... |
+| `blast` | BlastJobSubmitted, BlastJobCompleted, ... |
 
 ### Event Format
 
@@ -308,7 +335,7 @@ All settings in `appsettings.json`:
 ## Project Structure
 
 ```
-GeneFlow.APINET2/
+GeneFlow.ApiNet2/
 ├── GeneFlow.ApiNet.sln
 ├── GeneFlow.ApiNet.API/
 │   ├── Program.cs                   # Entry point, DI configuration
@@ -390,7 +417,7 @@ docker run -d \
 ```yaml
 api:
   build:
-    context: ./GeneFlow.APINET2
+    context: ./GeneFlow.ApiNet2
     dockerfile: GeneFlow.ApiNet.API/Dockerfile
   ports:
     - "5145:8080"
@@ -491,17 +518,15 @@ Compatible with GeneFlow Datalake consumer expecting:
 }
 ```
 
-### PostgreSQL Mounter
+### Mounters
 
-Events are projected by the Datalake's PostgresMounter to these schemas:
+Events are projected by the Datalake's Mounters to multiple targets:
 
-| Handler | Tables |
-|---------|--------|
-| UsersHandler | `identity.users` |
-| StudiesHandler | `studies.studies`, `studies.members` |
-| TracesHandler | `traces.traces`, `traces.annotations` |
-| AlignmentsHandler | `alignments.alignments` |
-| BillingHandler | `billing.plans`, `billing.subscriptions` |
+| Mounter | Target | Tables/Collections |
+|---------|--------|-------------------|
+| **PostgresMounter** | PostgreSQL | `identity.users`, `studies.*`, `traces.*`, `alignments.*`, `billing.*` |
+| **QdrantMounter** | Qdrant | `geneflow_sequences`, `geneflow_annotations`, `geneflow_traces` |
+| **StorageMounter** | Supabase/MinIO | `traces/{id}/chunks/`, `alignments/{id}/chunks/` |
 
 ---
 
