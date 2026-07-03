@@ -72,15 +72,16 @@ public sealed class ActivityEventRepository : IActivityEventRepository
         var clamped = ClampLimit(limit);
         var studyIdSet = visibleStudyIds.ToArray();
 
-        // Show events authored by the user (any visibility) OR public events OR
-        // study-scoped events on studies the user can see.
+        // Personal feed = the user's own events (any visibility) PLUS non-private
+        // events on studies the user is a member of. Global public events authored
+        // by unrelated users are intentionally excluded: those belong to the
+        // discovery feed, not to a user's personal activity.
         var query = _context.ActivityEvents.AsNoTracking()
             .Where(e =>
                 e.ActorUserId == userId
-                || e.Visibility == ActivityVisibility.Public
-                || (e.Visibility == ActivityVisibility.StudyMembers
-                    && e.StudyId != null
-                    && studyIdSet.Contains(e.StudyId)));
+                || (e.StudyId != null
+                    && studyIdSet.Contains(e.StudyId)
+                    && e.Visibility != ActivityVisibility.Private));
 
         query = ApplyCursor(query, cursor);
         return ExecutePagedAsync(query, clamped, cancellationToken);
